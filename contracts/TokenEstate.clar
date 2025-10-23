@@ -14,10 +14,30 @@
 (define-constant err-oracle-already-registered (err u108))
 (define-constant err-oracle-not-found (err u109))
 (define-constant err-valuation-not-found (err u110))
+(define-constant err-pool-exists (err u111))
+(define-constant err-pool-not-found (err u112))
+(define-constant err-not-pool-admin (err u113))
+(define-constant err-invalid-contribution (err u114))
+(define-constant err-claim-not-found (err u115))
+(define-constant err-claim-already-resolved (err u116))
+(define-constant err-insufficient-pool-balance (err u117))
+(define-constant err-not-pool-member (err u118))
+(define-constant err-locked-up (err u119))
+(define-constant err-buyback-pool-exists (err u120))
+(define-constant err-buyback-pool-not-found (err u121))
+(define-constant err-offer-not-found (err u122))
+(define-constant err-offer-expired (err u123))
+(define-constant err-insufficient-buyback-balance (err u124))
+(define-constant err-invalid-offer-price (err u125))
+(define-constant err-offer-not-active (err u126))
+(define-constant err-invalid-allocation-percentage (err u127))
 
 (define-data-var next-property-id uint u1)
 (define-data-var next-share-id uint u1)
 (define-data-var next-valuation-id uint u1)
+(define-data-var buyback-allocation-percentage uint u10)
+(define-data-var next-offer-id uint u1)
+(define-data-var next-buyback-tx-id uint u1)
 
 (define-map properties 
     uint 
@@ -98,6 +118,81 @@
 (define-map property-valuation-counter
     uint
     uint
+)
+
+(define-map share-unlock-heights
+    { share-id: uint }
+    { unlock-height: uint }
+)
+
+;; Insurance pool maps
+(define-map insurance-pools
+    uint
+    {
+        total-premium: uint,
+        total-claims: uint,
+        admin: principal,
+        created-at: uint,
+        is-active: bool
+    }
+)
+
+(define-map pool-members
+    { property-id: uint, member: principal }
+    {
+        contribution: uint,
+        joined-at: uint
+    }
+)
+
+(define-map insurance-claims
+    { property-id: uint, claim-id: uint }
+    {
+        claimer: principal,
+        amount: uint,
+        status: (string-ascii 20),
+        submitted-at: uint,
+        resolved-at: uint,
+        reason: (string-ascii 200)
+    }
+)
+
+(define-map pool-claim-counter
+    uint
+    uint
+)
+
+(define-map buyback-pools
+    uint
+    {
+        reserve: uint,
+        total-allocated: uint,
+        created-at: uint
+    }
+)
+
+(define-map buyback-offers
+    uint
+    {
+        property-id: uint,
+        seller: principal,
+        share-id: uint,
+        price-per-share: uint,
+        expires-at: uint,
+        is-active: bool
+    }
+)
+
+(define-map buyback-history
+    uint
+    {
+        property-id: uint,
+        buyer: principal,
+        seller: principal,
+        share-id: uint,
+        price: uint,
+        executed-at: uint
+    }
 )
 
 (define-public (register-property (address (string-ascii 100)) (value uint) (total-shares uint))
@@ -434,4 +529,154 @@
         next-valuation-id: (var-get next-valuation-id),
         contract-owner: contract-owner
     }
+)
+
+;; Buyback Feature Functions
+
+(define-public (initialize-buyback-pool (property-id uint))
+    (let
+        (
+            (property (unwrap! (map-get? properties property-id) err-property-not-found))
+        )
+        (asserts! (is-eq tx-sender (get owner property)) err-not-authorized)
+        (asserts! (is-none (map-get? buyback-pools property-id)) err-buyback-pool-exists)
+        
+        (map-set buyback-pools property-id {
+            reserve: u0,
+            total-allocated: u0,
+            created-at: stacks-block-height
+        })
+        
+        (print {event: "buyback-pool-initialized", property-id: property-id, owner: tx-sender})
+        (ok true)
+    )
+)
+
+(define-public (allocate-to-buyback (property-id uint) (amount uint))
+    (let
+        (
+            (property (unwrap! (map-get? properties property-id) err-property-not-found))
+            (pool (unwrap! (map-get? buyback-pools property-id) err-buyback-pool-not-found))
+        )
+        (asserts! (is-eq tx-sender (get owner property)) err-not-authorized)
+        (asserts! (> amount u0) err-insufficient-funds)
+        
+        (map-set buyback-pools property-id
+            (merge pool {reserve: (+ (get reserve pool) amount), total-allocated: (+ (get total-allocated pool) amount)})
+        )
+        
+        (print {event: "allocation-to-buyback", property-id: property-id, amount: amount})
+        (ok true)
+    )
+)
+
+(define-public (create-buyback-offer (property-id uint) (share-id uint) (price-per-share uint) (expires-at uint))
+    (let
+        (
+            (share (unwrap! (map-get? property-shares share-id) err-share-not-found))
+            (offer-id (var-get next-offer-id))
+        )
+        (asserts! (is-eq tx-sender (get owner share)) err-not-authorized)
+        (asserts! (is-eq (get property-id share) property-id) err-property-not-found)
+        (asserts! (> price-per-share u0) err-invalid-offer-price)
+        (asserts! (> expires-at stacks-block-height) err-offer-expired)
+        
+        (map-set buyback-offers offer-id {
+            property-id: property-id,
+            seller: tx-sender,
+            share-id: share-id,
+            price-per-share: price-per-share,
+            expires-at: expires-at,
+            is-active: true
+        })
+        
+        (var-set next-offer-id (+ offer-id u1))
+        
+        (print {event: "buyback-offer-created", offer-id: offer-id, property-id: property-id, seller: tx-sender, price: price-per-share})
+        (ok offer-id)
+    )
+)
+
+(define-public (execute-buyback (offer-id uint))
+    (let
+        (
+            (offer (unwrap! (map-get? buyback-offers offer-id) err-offer-not-found))
+            (pool (unwrap! (map-get? buyback-pools (get property-id offer)) err-buyback-pool-not-found))
+            (share (unwrap! (map-get? property-shares (get share-id offer)) err-share-not-found))
+            (total-cost (get price-per-share offer))
+            (tx-id (var-get next-buyback-tx-id))
+            (property (unwrap! (map-get? properties (get property-id offer)) err-property-not-found))
+        )
+        (asserts! (is-eq tx-sender (get owner property)) err-not-authorized)
+        (asserts! (get is-active offer) err-offer-not-active)
+        (asserts! (< stacks-block-height (get expires-at offer)) err-offer-expired)
+        (asserts! (>= (get reserve pool) total-cost) err-insufficient-buyback-balance)
+        
+        (map-set buyback-offers offer-id (merge offer {is-active: false}))
+        
+        (map-set buyback-pools (get property-id offer)
+            (merge pool {reserve: (- (get reserve pool) total-cost)})
+        )
+        
+        (try! (nft-transfer? property-share (get share-id offer) (get seller offer) tx-sender))
+        
+        (try! (as-contract (stx-transfer? total-cost (get seller offer) tx-sender)))
+        
+        (map-set buyback-history tx-id {
+            property-id: (get property-id offer),
+            buyer: tx-sender,
+            seller: (get seller offer),
+            share-id: (get share-id offer),
+            price: total-cost,
+            executed-at: stacks-block-height
+        })
+        
+        (var-set next-buyback-tx-id (+ tx-id u1))
+        
+        (print {event: "buyback-executed", offer-id: offer-id, property-id: (get property-id offer), tx-id: tx-id})
+        (ok tx-id)
+    )
+)
+
+(define-public (cancel-buyback-offer (offer-id uint))
+    (let
+        (
+            (offer (unwrap! (map-get? buyback-offers offer-id) err-offer-not-found))
+        )
+        (asserts! (is-eq tx-sender (get seller offer)) err-not-authorized)
+        (asserts! (get is-active offer) err-offer-not-active)
+        
+        (map-set buyback-offers offer-id (merge offer {is-active: false}))
+        
+        (print {event: "buyback-offer-cancelled", offer-id: offer-id})
+        (ok true)
+    )
+)
+
+(define-public (set-buyback-allocation-percentage (percentage uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-not-authorized)
+        (asserts! (and (>= percentage u0) (<= percentage u100)) err-invalid-allocation-percentage)
+        
+        (var-set buyback-allocation-percentage percentage)
+        
+        (print {event: "allocation-percentage-updated", percentage: percentage})
+        (ok true)
+    )
+)
+
+(define-read-only (get-buyback-pool (property-id uint))
+    (map-get? buyback-pools property-id)
+)
+
+(define-read-only (get-buyback-offer (offer-id uint))
+    (map-get? buyback-offers offer-id)
+)
+
+(define-read-only (get-buyback-transaction (tx-id uint))
+    (map-get? buyback-history tx-id)
+)
+
+(define-read-only (get-buyback-allocation-percentage)
+    (var-get buyback-allocation-percentage)
 )
