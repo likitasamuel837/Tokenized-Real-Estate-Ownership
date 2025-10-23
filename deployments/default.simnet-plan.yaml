@@ -66,6 +66,6 @@ plan:
         - emulated-contract-publish:
             contract-name: TokenEstate
             emulated-sender: ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM
-            path: contracts/TokenEstate.clar
+            path: "contracts\\TokenEstate.clar"
             clarity-version: 3
       epoch: "3.2"
